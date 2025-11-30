@@ -1,1 +1,36 @@
+import axios from 'axios'
 
+let handler = async (m, { conn, text, usedPrefix, command }) => {
+  if (!text) throw `Contoh:\n${usedPrefix + command} Dj 30 detik`
+
+  await m.react('✨') 
+
+  try {
+    let { data } = await axios.get('https://api-faa.my.id/faa/ytplayvid', {
+      params: {
+        q: text
+      }
+    })
+
+    if (!data.status) throw 'Gagal mengambil data dari API!'
+
+    let res = data.result
+    if (!res || !res.download_url) throw 'Video tidak ditemukan!'
+
+    await conn.sendMessage(m.chat, {
+      video: { url: res.download_url },
+      caption: `🎬 *YouTube Play Video*\n\n📌 Judul: *${res.searched_title}*\n🔗 URL: ${res.searched_url}`
+    }, { quoted: m })
+
+  } catch (e) {
+    console.error(e)
+    throw 'Gagal memproses permintaan!'
+  }
+}
+
+handler.help = ['ytplayvid <judul>']
+handler.tags = ['downloader']
+handler.command = /^ytplayvid$/i
+handler.limit = true
+
+export default handler
