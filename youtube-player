@@ -1,0 +1,2063 @@
+// ==========================================
+// Author  : If you like content like this, you can join this channel. 📲
+// Contact : https://t.me/jieshuo_materials
+// ==========================================
+
+require "import"
+import "android.widget.*"
+import "android.view.View"
+import "android.media.*"
+import "android.net.Uri"
+import "android.content.*"
+import "android.speech.*"
+import "android.text.*"
+import "cjson"
+import "android.app.*"
+import "android.os.*"
+import "java.util.Arrays"
+
+activity = this
+
+local timeHandler = Handler(Looper.getMainLooper())
+local timeRunnable
+
+local currentMediaPlayer = nil
+
+local isModeVideo = false
+
+local audioManager = activity.getSystemService(Context.AUDIO_SERVICE)
+local focusRequest = nil
+local audioFocusChangeListener
+
+local currentSpeed = 1.0
+local currentPitch = 1.0
+
+local currentVolumeBoost = 1.0
+
+local defaultQuality = "720"
+
+local currentSortOrder = "default"
+local currentFilter = "none"
+
+local isLooping = false
+local isAutoNext = true
+local autoShowSearch = true
+
+local MAX_SEEKBAR_VALUE = 300
+local SEEKBAR_STEP = 10
+local QUALITIES = {"360", "480", "720", "1080"}
+
+local PREFS_NAME = "PlaybackSettings"
+local prefs = activity.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+local videoQueue = {}
+
+local currentResults = nil
+local currentDisplayResults = {}
+local currentPlayingIndex = nil
+local currentSelectedURL = nil
+local currentSelectedQuality = nil
+
+local MAX_HISTORY = 10
+local searchHistory = {}
+
+function loadHistory()
+	local historyJson = prefs.getString("searchHistory", "[]")
+	local status, history = pcall(cjson.decode, historyJson)
+	if status and type(history) == "table" then
+		searchHistory = history
+	else
+		searchHistory = {}
+	end
+end
+
+function saveHistory()
+	local editor = prefs.edit()
+	editor.putString("searchHistory", cjson.encode(searchHistory))
+	editor.apply()
+end
+
+function addSearchHistory(query)
+	if not query or #query == 0 then return end
+
+		for i = #searchHistory, 1, -1 do
+			if searchHistory[i] == query then
+				table.remove(searchHistory, i)
+			end
+		end
+
+		table.insert(searchHistory, 1, query)
+
+		while #searchHistory > MAX_HISTORY do
+			table.remove(searchHistory)
+		end
+		saveHistory()
+	end
+
+	function loadSettings()
+		currentSpeed = prefs.getFloat("speed", 1.0)
+		currentPitch = prefs.getFloat("pitch", 1.0)
+		currentVolumeBoost = prefs.getFloat("volumeBoost", 1.0)
+		defaultQuality = prefs.getString("defaultQuality", "720")
+
+		isLooping = prefs.getBoolean("isLooping", false)
+		isModeVideo = prefs.getBoolean("isModeVideo", false)
+		isAutoNext = prefs.getBoolean("isAutoNext", true)
+		autoShowSearch = prefs.getBoolean("autoShowSearch", true)
+
+		loadHistory()
+	end
+
+	function saveSettings()
+		local editor = prefs.edit()
+		editor.putFloat("speed", currentSpeed)
+		editor.putFloat("pitch", currentPitch)
+		editor.putFloat("volumeBoost", currentVolumeBoost)
+		editor.putString("defaultQuality", defaultQuality)
+
+		editor.putBoolean("isLooping", isLooping)
+		editor.putBoolean("isModeVideo", isModeVideo)
+		editor.putBoolean("isAutoNext", isAutoNext)
+		editor.putBoolean("autoShowSearch", autoShowSearch)
+
+		editor.apply()
+	end
+
+	function vibrate()
+		local vibrator = activity.getSystemService(Context.VIBRATOR_SERVICE)
+		if vibrator and vibrator.hasVibrator() then
+			vibrator.vibrate(35)
+		end
+	end
+
+	function requestAudioFocus()
+		if audioManager == nil then return AudioManager.AUDIOFOCUS_REQUEST_FAILED end
+
+			local audioAttributes = AudioAttributes.Builder()
+			.setUsage(AudioAttributes.USAGE_MEDIA)
+			.setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+			.build()
+
+			if audioFocusChangeListener == nil then
+				audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener {
+					onAudioFocusChange = function(focusChange)
+					timeHandler.post(Runnable { run = function()
+							if currentMediaPlayer == nil then return end
+
+								if focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT or
+									focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK or
+									focusChange == AudioManager.AUDIOFOCUS_LOSS then
+									if currentMediaPlayer and currentMediaPlayer.isPlaying() then
+										videoPlayer.pause()
+										playPauseButton.text = "Play"
+										service.speak("Audio focus lost, paused.")
+									end
+								elseif focusChange == AudioManager.AUDIOFOCUS_GAIN then
+									if currentMediaPlayer and not currentMediaPlayer.isPlaying() and (playPauseButton.text == "Play") then
+										videoPlayer.start()
+										playPauseButton.text = "Pause"
+										applyPlaybackParams(currentSpeed, currentPitch)
+										applyVolumeBoost(currentVolumeBoost)
+										service.speak("Audio focus restored, resuming playback.")
+									end
+								end
+							end})
+				end
+				}
+		end
+
+		focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+		.setAudioAttributes(audioAttributes)
+		.setOnAudioFocusChangeListener(audioFocusChangeListener)
+		.build()
+
+		local result = audioManager.requestAudioFocus(focusRequest)
+		return result
+	end
+
+	function abandonAudioFocus()
+		if audioManager and focusRequest then
+			audioManager.abandonAudioFocusRequest(focusRequest)
+		end
+	end
+
+	function applyPlaybackParams(speed, pitch)
+
+		abandonAudioFocus()
+
+		local success = false
+		if currentMediaPlayer then
+			local params = PlaybackParams()
+			params.setSpeed(speed)
+			params.setPitch(pitch)
+
+			pcall(function()
+				currentMediaPlayer.setPlaybackParams(params)
+				success = true
+			end)
+	end
+
+	currentSpeed = speed
+	currentPitch = pitch
+
+	if success then
+		service.speak(string.format("Applied. Speed: %.2fx, Pitch: %.2fx", speed, pitch))
+	else
+		service.speak(string.format("Saved TEMPORARY settings: Speed: %.2fx, Pitch: %.2fx. Please Play a new video.", speed, pitch))
+	end
+
+	if currentMediaPlayer and currentMediaPlayer.isPlaying() then
+		requestAudioFocus()
+	end
+end
+
+function applyVolumeBoost(boost)
+	if currentMediaPlayer then
+		pcall(function()
+			currentMediaPlayer.setVolume(boost, boost)
+		end)
+end
+currentVolumeBoost = boost
+service.speak(string.format("Applied volume boost: %.1fx", boost))
+end
+
+function apiRequest(url, callback)
+	if not url or url == "" then
+		callback(nil, "Invalid URL parameter")
+		return
+	end
+
+	loadingBar.setVisibility(View.VISIBLE)
+
+	Thread(Runnable {
+			run = function()
+			Http.get(url, function(code, content)
+				timeHandler.post(Runnable { run = function()
+						loadingBar.setVisibility(View.GONE)
+						if code ~= 200 then
+							callback(nil, "HTTP Error: " .. code)
+							return
+						end
+						callback(content, nil)
+					end})
+			end)
+		end
+		}).start()
+end
+
+function searchYoutube(prompt, callback)
+	if not prompt or prompt == "" then
+		callback(nil, "Invalid parameter")
+		return
+	end
+	local url = "https://api.ootaizumi.web.id/search/youtube?query=" .. Uri.encode(prompt)
+	apiRequest(url, callback)
+end
+
+function getDownloadLink(youtubeUrl, type, quality, callback)
+	if not youtubeUrl or not type or not quality then
+		callback(nil, "Invalid parameter")
+		return
+	end
+
+	local url = "https://api.arincy.site/api/youtube?url=" .. Uri.encode(youtubeUrl) .. "&type=" .. Uri.encode(type) .. "&quality=" .. Uri.encode(quality)
+	apiRequest(url, callback)
+end
+
+function getTranscript(youtubeUrl, callback)
+	if not youtubeUrl or youtubeUrl == "" then
+		callback(nil, "Invalid parameter: Missing YouTube URL (ID)")
+		return
+	end
+
+	local request_url = "https://fetch-youtube-transcript-api.vercel.app/transcript/?url=" .. Uri.encode(youtubeUrl)
+
+	loadingBar.setVisibility(View.VISIBLE)
+
+	Thread(Runnable {
+			run = function()
+			Http.get(request_url, function(code, content)
+				timeHandler.post(Runnable { run = function()
+						loadingBar.setVisibility(View.GONE)
+
+						if code ~= 200 then
+							callback(nil, "HTTP Error: " .. code .. " - Video may lack subtitles or API may be faulty.")
+							return
+						end
+						local status, decoded_data = pcall(cjson.decode, content)
+						if not status then
+							callback(nil, "Could not parse server response: " .. tostring(decoded_data))
+							return
+						end
+						if decoded_data.success == true and decoded_data.transcripts then
+							local transcription = decoded_data.transcripts
+							callback(transcription, nil)
+						else
+							local error_msg = decoded_data.transcripts or decoded_data.error or "Unknown API error. Video may not support transcription."
+							callback(nil, "API Error: " .. error_msg)
+						end
+					end})
+			end)
+		end
+		}).start()
+end
+
+function showTranscriptDialog(transcriptText)
+	vibrate()
+
+	local processedText = transcriptText:gsub("\n\n+", ". ")
+	processedText = processedText:gsub("\n", ", ")
+	processedText = processedText:gsub(" +", " ")
+
+	if not processedText:match("[.?!]$") then
+		processedText = processedText .. "."
+	end
+
+	service.speak(processedText)
+
+	local aboutLayout = {
+		ScrollView,
+		layout_width = "fill",
+		layout_height = "fill",
+		backgroundColor = 0xFF121212,
+		{
+			TextView,
+			id = "transcriptContentView",
+			text = processedText,
+			layout_width = "fill",
+			layout_height = "wrap_content",
+			padding = "16dp",
+			textIsSelectable = true,
+			textColor = 0xFFFFFFFF,
+			},
+		}
+
+	local transcriptDlg = LuaDialog(activity)
+	transcriptDlg.setTitle("馃搵 Video Transcript")
+	transcriptDlg.setView(loadlayout(aboutLayout))
+	transcriptDlg.setButton("Close", function()
+		transcriptDlg.dismiss()
+		vibrate()
+	end)
+transcriptDlg.show()
+end
+
+function showChannelInfoAndQueue()
+	vibrate()
+
+	if currentPlayingIndex == nil or not videoQueue[currentPlayingIndex + 1] then
+		service.speak("No video currently playing to show information.")
+		return
+	end
+
+	local currentItem = videoQueue[currentPlayingIndex + 1]
+
+	local channelName = currentItem.channel or "Unknown Channel Name"
+
+	local queueListText = ""
+	for i, item in ipairs(videoQueue) do
+		local prefix = (i - 1 == currentPlayingIndex) and "鈻讹笍 " or "   "
+		queueListText = queueListText .. prefix .. i .. ". " .. (item.title or "N/A") .. " [" .. (item.timestamp or "N/A") .. "]\n"
+	end
+
+	local contentText = "Current Video:\n"
+	contentText = contentText .. "  - Title: " .. (currentItem.title or "N/A") .. "\n"
+	contentText = contentText .. "  - Channel: " .. channelName .. "\n"
+	contentText = contentText .. "  - Views: " .. (currentItem.views or "N/A") .. "\n"
+	contentText = contentText .. "\n"
+	contentText = contentText .. "馃幀 Playback Queue (" .. #videoQueue .. " items):\n"
+	contentText = contentText .. "------------------------------------\n"
+	contentText = contentText .. queueListText
+
+	local queueLayout = {
+		ScrollView,
+		layout_width = "fill",
+		layout_height = "fill",
+		{
+			TextView,
+			text = contentText,
+			layout_width = "fill",
+			layout_height = "wrap_content",
+			padding = "16dp",
+			textIsSelectable = true,
+			textSize = "14sp",
+			textColor = 0xFF000000,
+			},
+		}
+
+	local queueDlg = LuaDialog(activity)
+	queueDlg.setTitle("Playback Info & Queue")
+	local loadedLayout = loadlayout(queueLayout)
+	queueDlg.setView(loadedLayout)
+
+	queueDlg.setButton("Close", function()
+		vibrate()
+		queueDlg.dismiss()
+	end)
+
+queueDlg.show()
+end
+
+function showSearchHistory()
+	vibrate()
+	loadHistory()
+
+	if #searchHistory == 0 then
+		service.speak("Search history is empty.")
+		return
+	end
+
+	local historyDlg = LuaDialog(activity)
+	historyDlg.setTitle("Recent Search History")
+
+	local historyLayout = {
+		ListView,
+		id = "historyListView",
+		layout_width = "fill",
+		layout_height = "wrap_content",
+		padding = "16dp",
+		}
+
+	local loadedLayout = loadlayout(historyLayout)
+	historyDlg.setView(loadedLayout)
+
+	local historyListView = loadedLayout.findViewById(historyListView.id)
+
+	local adapter = ArrayAdapter(activity, android.R.layout.simple_list_item_1, searchHistory)
+	historyListView.setAdapter(adapter)
+
+	historyListView.onItemClick = function(parent, view, position, id)
+	vibrate()
+	local selectedQuery = searchHistory[position + 1]
+	if selectedQuery then
+		textInput.text = selectedQuery
+		searchHandler(selectedQuery)
+	end
+	historyDlg.dismiss()
+end
+
+historyDlg.setButton("Clear History", function()
+	vibrate()
+	searchHistory = {}
+	saveHistory()
+	historyDlg.dismiss()
+	service.speak("Search history cleared.")
+	end)
+
+historyDlg.setButton("Close", function() vibrate(); historyDlg.dismiss() end)
+historyDlg.show()
+end
+
+function showSpeedPitchDialog(parentDlg)
+	vibrate()
+
+	local tempSpeed = currentSpeed
+	local tempPitch = currentPitch
+
+	local function updateText(speedText, pitchText)
+	speedText.text = string.format("Speed: %.2fx", tempSpeed)
+	pitchText.text = string.format("Pitch: %.2fx", tempPitch)
+end
+
+local dialogLayout = {
+	LinearLayout,
+	orientation = "vertical",
+	padding = "16dp",
+
+	{
+		TextView,
+		id = "speedTextView",
+		layout_width = "wrap_content",
+		layout_height = "wrap_content",
+		textSize = "16sp",
+		text = string.format("Speed: %.2fx", tempSpeed),
+		},
+	{
+		LinearLayout,
+		orientation = "horizontal",
+		{
+			Button,
+			id = "speedMinusButton",
+			text = "-",
+			layout_width = "40dp",
+			layout_height = "wrap_content",
+			},
+		{
+			SeekBar,
+			id = "speedSeekBar",
+			layout_width = "0dp",
+			layout_weight = 1,
+			layout_height = "wrap_content",
+			max = MAX_SEEKBAR_VALUE,
+			progress = math.floor(tempSpeed * 100),
+			},
+		{
+			Button,
+			id = "speedPlusButton",
+			text = "+",
+			layout_width = "40dp",
+			layout_height = "wrap_content",
+			},
+		},
+
+	{
+		TextView,
+		id = "pitchTextView",
+		layout_width = "wrap_content",
+		layout_height = "wrap_content",
+		textSize = "16sp",
+		layout_marginTop = "16dp",
+		text = string.format("Pitch: %.2fx", tempPitch),
+		},
+	{
+		LinearLayout,
+		orientation = "horizontal",
+		{
+			Button,
+			id = "pitchMinusButton",
+			text = "-",
+			layout_width = "40dp",
+			layout_height = "wrap_content",
+			},
+		{
+			SeekBar,
+			id = "pitchSeekBar",
+			layout_width = "0dp",
+			layout_weight = 1,
+			layout_height = "wrap_content",
+			max = MAX_SEEKBAR_VALUE,
+			progress = math.floor(tempPitch * 100),
+			},
+		{
+			Button,
+			id = "pitchPlusButton",
+			text = "+",
+			layout_width = "40dp",
+			layout_height = "wrap_content",
+			},
+		},
+
+	{
+		LinearLayout,
+		orientation = "horizontal",
+		layout_marginTop = "24dp",
+		{
+			Button,
+			id = "applyParamsButton",
+			text = "Apply & Save",
+			layout_width = "0dp",
+			layout_weight = 1,
+			layout_height = "wrap_content",
+			},
+		{
+			Button,
+			id = "resetParamsButton",
+			text = "Default (1.0x)",
+			layout_width = "0dp",
+			layout_weight = 1,
+			layout_height = "wrap_content",
+			}
+		}
+	}
+
+local paramsDlg = LuaDialog(activity)
+paramsDlg.setTitle("Adjust Speed & Pitch")
+
+local loadedLayout = loadlayout(dialogLayout)
+paramsDlg.setView(loadedLayout)
+
+local speedSeekBar = loadedLayout.findViewById(speedSeekBar.id)
+local pitchSeekBar = loadedLayout.findViewById(pitchSeekBar.id)
+local speedTextView = loadedLayout.findViewById(speedTextView.id)
+local pitchTextView = loadedLayout.findViewById(pitchTextView.id)
+
+speedSeekBar.setOnSeekBarChangeListener(SeekBar.OnSeekBarChangeListener{
+		onProgressChanged = function(sb, progress, fromUser)
+		tempSpeed = progress / 100.0
+		updateText(speedTextView, pitchTextView)
+		end,
+		onStartTrackingTouch = function(sb) end,
+		onStopTrackingTouch = function(sb) end
+		})
+
+pitchSeekBar.setOnSeekBarChangeListener(SeekBar.OnSeekBarChangeListener{
+		onProgressChanged = function(sb, progress, fromUser)
+		tempPitch = progress / 100.0
+		updateText(speedTextView, pitchTextView)
+		end,
+		onStartTrackingTouch = function(sb) end,
+		onStopTrackingTouch = function(sb) end
+		})
+
+loadedLayout.findViewById(speedMinusButton.id).onClick = function()
+vibrate()
+local newProgress = math.max(0, speedSeekBar.getProgress() - SEEKBAR_STEP)
+speedSeekBar.setProgress(newProgress)
+tempSpeed = newProgress / 100.0
+updateText(speedTextView, pitchTextView)
+end
+loadedLayout.findViewById(speedPlusButton.id).onClick = function()
+vibrate()
+local newProgress = math.min(MAX_SEEKBAR_VALUE, speedSeekBar.getProgress() + SEEKBAR_STEP)
+speedSeekBar.setProgress(newProgress)
+tempSpeed = newProgress / 100.0
+updateText(speedTextView, pitchTextView)
+end
+
+loadedLayout.findViewById(pitchMinusButton.id).onClick = function()
+vibrate()
+local newProgress = math.max(0, pitchSeekBar.getProgress() - SEEKBAR_STEP)
+pitchSeekBar.setProgress(newProgress)
+tempPitch = newProgress / 100.0
+updateText(speedTextView, pitchTextView)
+end
+loadedLayout.findViewById(pitchPlusButton.id).onClick = function()
+vibrate()
+local newProgress = math.min(MAX_SEEKBAR_VALUE, pitchSeekBar.getProgress() + SEEKBAR_STEP)
+pitchSeekBar.setProgress(newProgress)
+tempPitch = newProgress / 100.0
+updateText(speedTextView, pitchTextView)
+end
+
+loadedLayout.findViewById(applyParamsButton.id).onClick = function()
+vibrate()
+currentSpeed = tempSpeed
+currentPitch = tempPitch
+saveSettings()
+applyPlaybackParams(currentSpeed, currentPitch)
+paramsDlg.dismiss()
+parentDlg.dismiss()
+service.speak("Saved Speed and Pitch. Play new video to apply.")
+end
+
+loadedLayout.findViewById(resetParamsButton.id).onClick = function()
+vibrate()
+currentSpeed = 1.0
+currentPitch = 1.0
+saveSettings()
+applyPlaybackParams(1.0, 1.0)
+paramsDlg.dismiss()
+parentDlg.dismiss()
+service.speak("Reset Speed and Pitch to default. Play new video to apply.")
+end
+
+paramsDlg.setButton("Cancel", function() vibrate() paramsDlg.dismiss() end)
+
+paramsDlg.show()
+end
+
+function showSettingsDialog()
+	vibrate()
+
+	local settingsDlg = LuaDialog(activity)
+	settingsDlg.setTitle("鈿欙笍 General Settings")
+
+	local qualityIndex = -1
+	for i, q in ipairs(QUALITIES) do
+		if q == defaultQuality then
+			qualityIndex = i - 1
+			break
+		end
+	end
+
+	local tempVolumeBoost = currentVolumeBoost
+	local function updateVolumeBoostText(textView)
+	textView.text = string.format("Volume Boost: %.1fx (Max 2.0x)", tempVolumeBoost)
+end
+
+local settingsLayout = {
+	ScrollView,
+	layout_width = "fill",
+	layout_height = "fill",
+	{
+		LinearLayout,
+		orientation = "vertical",
+		padding = "16dp",
+
+		{
+			TextView,
+			text = "Default Video Quality (Only applies on new Playback):",
+			layout_width = "wrap_content",
+			layout_height = "wrap_content",
+			textSize = "16sp",
+			layout_marginBottom = "8dp",
+			},
+
+		{
+			Switch,
+			id = "modeVideoSwitch",
+			text = "Mode Video (MP4) / \nTurn off for audio (MP3)",
+			layout_width = "fill",
+			layout_height = "wrap_content",
+			checked = isModeVideo,
+			layout_marginTop = "8dp",
+			},
+
+		{
+			Spinner,
+			id = "qualitySpinner",
+			layout_width = "fill",
+			layout_height = "wrap_content",
+			},
+
+		{
+			TextView,
+			id = "volumeBoostTextView",
+			text = string.format("Volume Boost: %.1fx (Max 2.0x)", currentVolumeBoost),
+			layout_width = "wrap_content",
+			layout_height = "wrap_content",
+			textSize = "16sp",
+			layout_marginTop = "16dp",
+			layout_marginBottom = "8dp",
+			},
+		{
+			SeekBar,
+			id = "volumeBoostSeekBar",
+			layout_width = "fill",
+			layout_height = "wrap_content",
+			max = 20,
+			progress = math.floor(currentVolumeBoost * 10),
+			},
+		{
+			LinearLayout,
+			orientation = "horizontal",
+			layout_marginTop = "8dp",
+			{
+				Button,
+				id = "resetVolumeBoostButton",
+				text = "Default (1.0x)",
+				layout_width = "0dp",
+				layout_weight = 1,
+				layout_height = "wrap_content",
+				},
+			{
+				Button,
+				id = "applyVolumeBoostButton",
+				text = "Apply & Save",
+				layout_width = "0dp",
+				layout_weight = 1,
+				layout_height = "wrap_content",
+				},
+			},
+
+		{
+			TextView,
+			text = "Player Options:",
+			layout_width = "wrap_content",
+			layout_height = "wrap_content",
+			textSize = "18sp",
+			textColor = 0xFFBB86FC,
+			layout_marginTop = "24dp",
+			layout_marginBottom = "8dp",
+			},
+
+		{
+			Switch,
+			id = "loopSwitch",
+			text = "Loop Current Video",
+			layout_width = "fill",
+			layout_height = "wrap_content",
+			checked = isLooping,
+			},
+		{
+			Switch,
+			id = "autoNextSwitch",
+			text = "Auto Next Song in Queue",
+			layout_width = "fill",
+			layout_height = "wrap_content",
+			checked = isAutoNext,
+			},
+		{
+			Switch,
+			id = "autoSearchSwitch",
+			text = "Auto Show Search on Stop",
+			layout_width = "fill",
+			layout_height = "wrap_content",
+			checked = autoShowSearch,
+			layout_marginBottom = "16dp",
+			},
+
+		{
+			TextView,
+			id = "currentSpeedPitchText",
+			text = string.format("Speed: %.2fx, Pitch: %.2fx (Tap to change)", currentSpeed, currentPitch),
+			layout_width = "fill",
+			layout_height = "wrap_content",
+			textSize = "16sp",
+			layout_marginTop = "24dp",
+			padding = "10dp",
+			backgroundColor = 0xFF3700B3,
+			textColor = 0xFFFFFFFF,
+			},
+
+		{
+			Button,
+			id = "editSpeedPitchButton",
+			text = "Adjust Speed / Pitch",
+			layout_width = "fill",
+			layout_height = "wrap_content",
+			layout_marginTop = "8dp",
+			},
+
+		{
+			Button,
+			id = "infoButton",
+			text = "Development Info",
+			layout_width = "fill",
+			layout_height = "wrap_content",
+			layout_marginTop = "16dp",
+			},
+		}
+	}
+
+local loadedLayout = loadlayout(settingsLayout)
+settingsDlg.setView(loadedLayout)
+
+local qualitySpinner = loadedLayout.findViewById(qualitySpinner.id)
+local volumeBoostTextView = loadedLayout.findViewById(volumeBoostTextView.id)
+local volumeBoostSeekBar = loadedLayout.findViewById(volumeBoostSeekBar.id)
+local applyVolumeBoostButton = loadedLayout.findViewById(applyVolumeBoostButton.id)
+local resetVolumeBoostButton = loadedLayout.findViewById(resetVolumeBoostButton.id)
+local editSpeedPitchButton = loadedLayout.findViewById(editSpeedPitchButton.id)
+local infoButton = loadedLayout.findViewById(infoButton.id)
+
+local loopSwitch = loadedLayout.findViewById(loopSwitch.id)
+local autoNextSwitch = loadedLayout.findViewById(autoNextSwitch.id)
+local autoSearchSwitch = loadedLayout.findViewById(autoSearchSwitch.id)
+
+local javaQualities = String[#QUALITIES]
+for i, q in ipairs(QUALITIES) do
+	javaQualities[i - 1] = q
+end
+local qualityAdapter = ArrayAdapter(
+	activity,
+	android.R.layout.simple_spinner_dropdown_item,
+	javaQualities
+	)
+qualitySpinner.setAdapter(qualityAdapter)
+qualitySpinner.setSelection(qualityIndex)
+
+volumeBoostSeekBar.setOnSeekBarChangeListener(SeekBar.OnSeekBarChangeListener{
+		onProgressChanged = function(sb, progress, fromUser)
+		tempVolumeBoost = progress / 10.0
+		updateVolumeBoostText(volumeBoostTextView)
+		end,
+		onStartTrackingTouch = function(sb) end,
+		onStopTrackingTouch = function(sb) end
+		})
+
+applyVolumeBoostButton.onClick = function()
+vibrate()
+currentVolumeBoost = tempVolumeBoost
+saveSettings()
+applyVolumeBoost(currentVolumeBoost)
+settingsDlg.dismiss()
+service.speak("Saved Volume Boost. Play new video to apply.")
+end
+
+resetVolumeBoostButton.onClick = function()
+vibrate()
+volumeBoostSeekBar.setProgress(10)
+currentVolumeBoost = 1.0
+saveSettings()
+applyVolumeBoost(1.0)
+settingsDlg.dismiss()
+service.speak("Reset Volume to default. Play new video to apply.")
+end
+
+loopSwitch.setOnCheckedChangeListener(CompoundButton.OnCheckedChangeListener {
+		onCheckedChanged = function(buttonView, isChecked)
+		vibrate()
+		isLooping = isChecked
+		saveSettings()
+		if currentMediaPlayer then
+			currentMediaPlayer.setLooping(isLooping)
+		end
+		service.speak("Loop video: " .. (isChecked and "On" or "Off"))
+		end
+		})
+
+autoNextSwitch.setOnCheckedChangeListener(CompoundButton.OnCheckedChangeListener {
+		onCheckedChanged = function(buttonView, isChecked)
+		vibrate()
+		isAutoNext = isChecked
+		saveSettings()
+		service.speak("Auto next song: " .. (isChecked and "On" or "Off"))
+		end
+		})
+
+local modeVideoSwitch = loadedLayout.findViewById(modeVideoSwitch.id)
+modeVideoSwitch.setOnCheckedChangeListener(CompoundButton.OnCheckedChangeListener {
+		onCheckedChanged = function(buttonView, isChecked)
+		vibrate()
+		isModeVideo = isChecked
+		saveSettings()
+		local modeName = isChecked and "Video (MP4)" or "Audio (MP3)"
+		service.speak("Mode media diatur ke: " .. modeName)
+		end
+		})
+
+autoSearchSwitch.setOnCheckedChangeListener(CompoundButton.OnCheckedChangeListener {
+		onCheckedChanged = function(buttonView, isChecked)
+		vibrate()
+		autoShowSearch = isChecked
+		saveSettings()
+		service.speak("Auto show search: " .. (isChecked and "On" or "Off"))
+		end
+		})
+
+qualitySpinner.setOnItemSelectedListener(AdapterView.OnItemSelectedListener {
+		onItemSelected = function(parent, view, position, id)
+		vibrate()
+		local newQuality = QUALITIES[position + 1]
+		if newQuality ~= defaultQuality then
+			defaultQuality = newQuality
+			saveSettings()
+			service.speak("Default quality saved as " .. newQuality .. "p")
+		end
+		end,
+		onNothingSelected = function(parent) end
+		})
+
+editSpeedPitchButton.onClick = function()
+showSpeedPitchDialog(settingsDlg)
+end
+
+infoButton.onClick = function()
+vibrate()
+settingsDlg.dismiss()
+showDevelopmentInfo()
+end
+
+settingsDlg.setButton("Close Settings", function()
+	vibrate()
+	settingsDlg.dismiss()
+	end)
+
+settingsDlg.show()
+end
+
+function showDevelopmentInfo()
+	local aboutLayout = {
+		ScrollView,
+		layout_width = "fill",
+		layout_height = "fill",
+		backgroundColor = 0xFF121212,
+		{
+			LinearLayout,
+			orientation = "vertical",
+			layout_width = "fill",
+			layout_height = "wrap",
+			padding = "16dp",
+			{
+				TextView,
+				text = "Join my channel for other Jieshuo plugin tools",
+				layout_width = "fill",
+				layout_height = "wrap_content",
+				textSize = "20sp",
+				textColor = 0xFFFFFFFF,
+				gravity = "center",
+				backgroundColor = 0xFF6200EE,
+				padding = "12dp"
+				},
+			{
+				TextView,
+				text = "Script developed by: angel",
+				textSize = "14sp",
+				textColor = 0xFFCCCCCC,
+				gravity = "center",
+				layout_marginTop = "16dp",
+				},
+			{
+				TextView,
+				text = "API Service by: ZenzzXD & Luthfi Joestars (Arincy)",
+				textSize = "14sp",
+				textColor = 0xFFCCCCCC,
+				gravity = "center",
+				layout_marginTop = "8dp",
+				paddingBottom = "10dp"
+				},
+			{
+				Button,
+				text = "Join Script Dev Channel (angel)",
+				layout_width = "fill",
+				layout_height = "wrap",
+				backgroundColor = 0xFFBB86FC,
+				textColor = 0xFFFFFFFF,
+				padding = "12dp",
+				onClick = function()
+				vibrate()
+				pcall(function()
+					service.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://t.me/jieshuo_materials")))
+				end)
+			service.speak("Opening Telegram channel...")
+			aboutDlg.dismiss()
+			end
+			},
+		}
+	}
+
+aboutDlg = LuaDialog(activity)
+aboutDlg.setTitle("Developed by angel")
+aboutDlg.setView(loadlayout(aboutLayout))
+aboutDlg.setButton("OK", function()
+	aboutDlg.dismiss()
+	vibrate()
+	end)
+aboutDlg.show()
+end
+
+function parseViews(viewStr)
+	local v = viewStr:match("^([%d%.]+)") or "0"
+	local modifier = viewStr:match("([KMTB])$")
+	v = tonumber(v) or 0
+	if modifier == 'K' then return v * 1000 end
+		if modifier == 'M' then return v * 1000000 end
+			return v
+		end
+
+		function parseDurationToSeconds(durationStr)
+			if not durationStr or durationStr == "00:00" or durationStr == "" then
+				return 0
+			end
+
+			local parts = {durationStr:match("^(%d*):?(%d*):?(%d*)$")}
+
+			local function toNum(str)
+			return tonumber(str) or 0
+		end
+
+		local durationSec = 0
+
+		if #parts == 3 then
+			durationSec = (toNum(parts[1]) * 3600) + (toNum(parts[2]) * 60) + toNum(parts[3])
+		elseif #parts == 2 then
+			durationSec = (toNum(parts[1]) * 60) + toNum(parts[2])
+		elseif #parts == 1 then
+			durationSec = toNum(parts[1])
+		else
+			durationSec = 0
+		end
+
+		return durationSec
+	end
+
+	function applySortAndFilter(data, sortOrder, filter)
+		if not data or #data == 0 then return {} end
+
+			local processingData = {}
+			for _, item in ipairs(data) do
+				table.insert(processingData, item)
+				item.durationSec = parseDurationToSeconds(item.timestamp or "00:00")
+			end
+
+			local filteredData = {}
+
+			for _, item in ipairs(processingData) do
+				local passedFilter = true
+				if filter == ">10m" then
+					if item.durationSec < 600 then passedFilter = false end
+					elseif filter == "<5m" then
+						if item.durationSec > 300 then passedFilter = false end
+						end
+
+						if passedFilter then
+							table.insert(filteredData, item)
+						end
+					end
+
+					if sortOrder == "views" then
+						table.sort(filteredData, function(a, b)
+							return parseViews(a.views or "0") > parseViews(b.views or "0")
+						end)
+				elseif sortOrder == "duration" then
+					table.sort(filteredData, function(a, b)
+						return a.durationSec > b.durationSec
+					end)
+			end
+
+			return filteredData
+		end
+
+		function updateResultList(results)
+			if not results or #results == 0 then return end
+
+				local dataToDisplay = applySortAndFilter(results, currentSortOrder, currentFilter)
+
+				currentResults = results
+				currentDisplayResults = dataToDisplay
+
+				local titles = {}
+				for i, item in ipairs(dataToDisplay) do
+					local title = item.title or "Unknown title"
+					local duration = item.timestamp or "N/A"
+					table.insert(titles, string.format("%d. %s [%s] (%s)", i, title, duration, item.views or "0 views"))
+				end
+
+				local adapter = ArrayAdapter(activity, android.R.layout.simple_list_item_1, titles)
+				resultsList.setAdapter(adapter)
+				resultsList.setVisibility(View.VISIBLE)
+				resultActionsLayout.setVisibility(View.VISIBLE)
+
+				local resultCount = #dataToDisplay
+				local filterStatus = (currentFilter ~= "none" or currentSortOrder ~= "default") and " (Filtered/Sorted)" or ""
+				updateResultText(string.format("Found %d results%s. Please select a video or Add to Queue.", resultCount, filterStatus))
+			end
+
+			function showSortFilterDialog()
+				vibrate()
+
+				local sortOptions = {"default", "views", "duration"}
+				local sortNames = {"Default", "Views (Descending)", "Duration (Descending)"}
+				local sortIndex = 0
+				for i, opt in ipairs(sortOptions) do
+					if opt == currentSortOrder then sortIndex = i - 1; break end
+					end
+
+					local filterOptions = {"none", "<5m", ">10m"}
+					local filterNames = {"No Filter", "Under 5 minutes", "Over 10 minutes"}
+					local filterIndex = 0
+					for i, opt in ipairs(filterOptions) do
+						if opt == currentFilter then filterIndex = i - 1; break end
+						end
+
+						local layout = {
+							LinearLayout,
+							orientation = "vertical",
+							padding = "16dp",
+
+							{TextView, text = "Select Sort Order:", textSize = "16sp", layout_marginBottom = "8dp"},
+							{
+								Spinner,
+								id = "sortSpinner",
+								layout_width = "fill",
+								layout_height = "wrap_content",
+								},
+
+							{TextView, text = "Select Duration Filter:", textSize = "16sp", layout_marginTop = "16dp", layout_marginBottom = "8dp"},
+							{
+								Spinner,
+								id = "filterSpinner",
+								layout_width = "fill",
+								layout_height = "wrap_content",
+								},
+
+							{Button, id = "applySortFilterButton", text = "Apply", layout_width = "fill", layout_height = "wrap_content", layout_marginTop = "24dp"},
+							}
+
+						local dlg = LuaDialog(activity)
+						dlg.setTitle("Sort & Filter Results")
+						local loadedLayout = loadlayout(layout)
+						dlg.setView(loadedLayout)
+
+						local sortSpinner = loadedLayout.findViewById(sortSpinner.id)
+						local filterSpinner = loadedLayout.findViewById(filterSpinner.id)
+						local applyButton = loadedLayout.findViewById(applySortFilterButton.id)
+
+						local javaSortNames = String[#sortNames]
+						for i, n in ipairs(sortNames) do javaSortNames[i-1] = n end
+
+							local javaFilterNames = String[#filterNames]
+							for i, n in ipairs(filterNames) do javaFilterNames[i-1] = n end
+
+								sortSpinner.setAdapter(ArrayAdapter(activity, android.R.layout.simple_spinner_dropdown_item, javaSortNames))
+								filterSpinner.setAdapter(ArrayAdapter(activity, android.R.layout.simple_spinner_dropdown_item, javaFilterNames))
+
+								sortSpinner.setSelection(sortIndex)
+								filterSpinner.setSelection(filterIndex)
+
+								applyButton.onClick = function()
+								vibrate()
+								local newSortIndex = sortSpinner.getSelectedItemPosition()
+								local newFilterIndex = filterSpinner.getSelectedItemPosition()
+
+								currentSortOrder = sortOptions[newSortIndex + 1]
+								currentFilter = filterOptions[newFilterIndex + 1]
+
+								if currentResults then
+									updateResultList(currentResults)
+								else
+									service.speak("No results to apply to.")
+								end
+								dlg.dismiss()
+							end
+
+							dlg.setButton("Cancel", function() vibrate(); dlg.dismiss() end)
+							dlg.show()
+						end
+
+						dlg = LuaDialog(this)
+
+						local mainLayout = {
+							LinearLayout,
+							orientation = "vertical",
+							layout_width = "fill",
+							layout_height = "fill",
+
+							{
+								VideoView,
+								id = "videoPlayer",
+								layout_width = "fill",
+								layout_height = "300dp",
+								visibility = "gone",
+								},
+
+							{
+								TextView,
+								id = "timeText",
+								text = "00:00 / 00:00",
+								layout_width = "fill",
+								layout_height = "wrap_content",
+								textColor = 0xFFFFFFFF,
+								gravity = "center",
+								padding = "4dp",
+								backgroundColor = 0xFF212121,
+								visibility = "gone"
+								},
+
+							{
+								SeekBar,
+								id = "seekBar",
+								layout_width = "fill",
+								layout_height = "wrap_content",
+								paddingLeft = "16dp",
+								paddingRight = "16dp",
+								visibility = "gone"
+								},
+							{
+								LinearLayout,
+								id = "controlButtonsLayout",
+								orientation = "horizontal",
+								layout_width = "fill",
+								layout_height = "wrap_content",
+								visibility = "gone",
+								paddingLeft = "16dp",
+								paddingRight = "16dp",
+
+								{       Button,       id = "previousButton",       text = "Prev. Song",
+									layout_width = "0dp",       layout_weight = 1,       layout_height = "wrap_content",       },
+
+								{
+									Button,
+									id = "rewindButton",
+									text = "Rewind 10 Sec",
+									layout_width = "0dp",
+									layout_weight = 1,
+									layout_height = "wrap_content",
+									},
+								{
+									Button,
+									id = "replayButton",
+									text = "Replay",
+									layout_width = "0dp",
+									layout_weight = 1,
+									layout_height = "wrap_content",
+									},
+								{
+									Button,
+									id = "playPauseButton",
+									text = "Play",
+									layout_width = "0dp",
+									layout_weight = 1,
+									layout_height = "wrap_content",
+									},
+								{
+									Button,
+									id = "forwardButton",
+									text = "Forward 10 Sec",
+									layout_width = "0dp",
+									layout_weight = 1,
+									layout_height = "wrap_content",
+									},
+								{
+									Button,
+									id = "showChannelQueueButton",
+									text = "鈩癸笍 Channel / Queue",
+									layout_width = "0dp",
+									layout_weight = 1,
+									layout_height = "wrap_content",
+									enabled = false,
+									}
+								},
+							{
+								LinearLayout,
+								id = "navigationButtonsLayout",
+								orientation = "horizontal",
+								layout_width = "fill",
+								layout_height = "wrap_content",
+								visibility = "gone",
+								paddingLeft = "16dp",
+								paddingRight = "16dp",
+
+								{
+									Button,
+									id = "addToQueueSingleButton",
+									text = "鉃� Add to Queue",
+									layout_width = "0dp",
+									layout_weight = 1,
+									layout_height = "wrap_content",
+									layout_marginRight = "8dp",
+									enabled = false,
+									},
+
+								{
+									Button,
+									id = "nextButton",
+									text = "Next Song",
+									layout_width = "0dp",
+									layout_weight = 1,
+									layout_height = "wrap_content",
+									}
+								},
+
+							{
+								LinearLayout,
+								id = "queueActionsLayout",
+								orientation = "horizontal",
+								layout_width = "fill",
+								layout_height = "wrap_content",
+								visibility = "gone",
+								paddingLeft = "16dp",
+								paddingRight = "16dp",
+
+								{
+									Button,
+									id = "clearQueueButton",
+									text = "鉂� Clear Queue",
+									layout_width = "0dp",
+									layout_weight = 1,
+									layout_height = "wrap_content",
+									},
+
+								{
+									Button,
+									id = "transcriptButton",
+									text = "馃搵 Transcript",
+									layout_width = "0dp",
+									layout_weight = 1,
+									layout_height = "wrap_content",
+									enabled = false,
+									}
+								},
+
+							{
+								LinearLayout,
+								id = "searchLayout",
+								orientation = "vertical",
+								layout_width = "fill",
+								layout_height = "wrap_content",
+								padding = "16dp",
+
+								{
+									LinearLayout,
+									orientation="horizontal",
+									layout_width="fill",
+									layout_height="wrap_content",
+									{
+										EditText,
+										id = "textInput",
+										hint = "Enter song title or artist...",
+										layout_width = "0dp",
+										layout_weight = "1",
+										layout_height = "wrap_content",
+										padding = "10dp",
+										gravity = "top",
+										inputType = InputType.TYPE_CLASS_TEXT,
+										layout_marginTop = "10dp"
+										},
+									{
+										ImageButton,
+										id = "micSearchButton",
+										src = "@android:drawable/ic_btn_speak_now",
+										layout_width = "wrap_content",
+										layout_height = "fill",
+										contentDescription = "Voice Search",
+										layout_marginTop = "10dp"
+										}
+									},
+
+								{
+									LinearLayout,
+									orientation = "horizontal",
+									layout_width = "fill",
+									layout_height = "wrap_content",
+									layout_marginTop = "8dp",
+
+									{
+										Button,
+										id = "searchButton",
+										text = "Search Video",
+										layout_width = "0dp",
+										layout_weight = 1,
+										layout_height = "wrap_content"
+										},
+									{
+										Button,
+										id = "historyButton",
+										text = "History",
+										layout_width = "0dp",
+										layout_weight = 0.5,
+										layout_height = "wrap_content",
+										layout_marginLeft = "8dp",
+										},
+									},
+
+								{
+									ProgressBar,
+									id = "loadingBar",
+									layout_width = "fill",
+									layout_height = "wrap_content",
+									style = "?android:attr/progressBarStyleHorizontal",
+									visibility = "gone",
+									indeterminate = true,
+									},
+
+								{
+									TextView,
+									id = "resultText",
+									text = "Enter query to start.",
+									layout_width = "fill",
+									layout_height = "wrap_content",
+									padding = "10dp"
+									},
+								},
+
+							{
+								ListView,
+								id = "resultsList",
+								layout_width = "fill",
+								layout_height = "0dp",
+								layout_weight = 1,
+								visibility = "gone",
+								paddingLeft = "16dp",
+								paddingRight = "16dp",
+								},
+
+							{
+								LinearLayout,
+								orientation = "horizontal",
+								layout_width = "fill",
+								layout_height = "wrap_content",
+								id = "resultActionsLayout",
+								visibility = "gone",
+								paddingLeft = "16dp",
+								paddingRight = "16dp",
+								layout_marginBottom = "16dp",
+
+								{
+									Button,
+									id = "sortFilterButton",
+									text = "鈬� Sort / Filter",
+									layout_width = "0dp",
+									layout_weight = 1,
+									layout_height = "wrap_content",
+									layout_marginRight = "8dp",
+									},
+
+								{
+									Button,
+									id = "addToQueueButton",
+									text = "鉃� Add Results to Queue",
+									layout_width = "0dp",
+									layout_weight = 1,
+									layout_height = "wrap_content",
+									},
+								},
+
+							{
+								LinearLayout,
+								orientation = "horizontal",
+								layout_width = "fill",
+								layout_height = "wrap_content",
+								padding = "16dp",
+
+								{
+									Button,
+									id = "downloadVideoButton",
+									text = "Download MP4 (Video)",
+									layout_width = "0dp",
+									layout_weight = 1,
+									layout_height = "wrap_content",
+									enabled = false,
+									},
+								{
+									Button,
+									id = "downloadAudioButton",
+									text = "Download MP3 (Audio)",
+									layout_width = "0dp",
+									layout_weight = 1,
+									layout_height = "wrap_content",
+									enabled = false,
+									},
+								{
+									Button,
+									id = "settingsButton",
+									text = "Settings",
+									layout_width = "0dp",
+									layout_weight = 1,
+									layout_height = "wrap_content",
+									},
+								{
+									Button,
+									id = "closeButton",
+									text = "Close",
+									layout_width = "0dp",
+									layout_weight = 1,
+									layout_height = "wrap_content",
+									}
+								}
+							}
+
+						loadSettings()
+
+						dlg.setView(loadlayout(mainLayout))
+
+						function updatePlaybackTime()
+							if videoPlayer and videoPlayer.isPlaying() and videoPlayer.getDuration() > 0 then
+								local currentPos = videoPlayer.getCurrentPosition()
+								local duration = videoPlayer.getDuration()
+
+								seekBar.setMax(duration)
+								seekBar.setProgress(currentPos)
+
+								local currentMinutes = math.floor(currentPos / 60000)
+								local currentSeconds = math.floor((currentPos % 60000) / 1000)
+								local durationMinutes = math.floor(duration / 60000)
+								local durationSeconds = math.floor((duration % 60000) / 1000)
+
+								local currentStr = string.format("%02d:%02d", currentMinutes, currentSeconds)
+								local durationStr = string.format("%02d:%02d", durationMinutes, durationSeconds)
+
+								timeText.text = currentStr .. " / " .. durationStr
+							end
+
+							timeHandler.postDelayed(timeRunnable, 1000)
+						end
+
+						timeRunnable = Runnable {
+							run = updatePlaybackTime
+							}
+
+						function startUpdateTime()
+							timeHandler.post(timeRunnable)
+						end
+
+						function stopUpdateTime()
+							timeHandler.removeCallbacks(timeRunnable)
+						end
+
+						function updateResultText(result)
+							resultText.text = result
+							service.speak(result)
+						end
+
+						function resetUi()
+							videoPlayer.setVisibility(View.GONE)
+							timeText.setVisibility(View.GONE)
+							seekBar.setVisibility(View.GONE)
+							loadingBar.setVisibility(View.GONE)
+							addToQueueButton.setVisibility(View.GONE)
+							resultActionsLayout.setVisibility(View.GONE)
+							queueActionsLayout.setVisibility(View.GONE)
+
+							downloadVideoButton.setEnabled(false)
+							downloadAudioButton.setEnabled(false)
+							transcriptButton.setEnabled(false)
+							showChannelQueueButton.setEnabled(false)
+							addToQueueSingleButton.setEnabled(false)
+
+							resultsList.setVisibility(View.GONE)
+							controlButtonsLayout.setVisibility(View.GONE)
+							navigationButtonsLayout.setVisibility(View.GONE)
+
+							if searchLayout.getVisibility() == View.GONE then
+								searchLayout.setVisibility(View.VISIBLE)
+							end
+
+							currentMediaPlayer = nil
+							abandonAudioFocus()
+
+							currentResults = nil
+							currentDisplayResults = {}
+							currentPlayingIndex = nil
+							currentSelectedURL = nil
+							currentSelectedQuality = nil
+
+							playPauseButton.text = "Play"
+							timeText.text = "00:00 / 00:00"
+							stopUpdateTime()
+						end
+
+						function autoShowSearchLayout()
+							if not autoShowSearch then return end
+								timeHandler.postDelayed(Runnable{
+										run = function()
+										if videoPlayer ~= nil and currentMediaPlayer ~= nil then
+											local isPlaying = videoPlayer.isPlaying()
+											if not isPlaying and searchLayout.getVisibility() == View.GONE then
+												searchLayout.setVisibility(View.VISIBLE)
+												service.speak("Video stopped. Search interface restored.")
+											end
+										else
+											if searchLayout.getVisibility() == View.GONE then
+												searchLayout.setVisibility(View.VISIBLE)
+												service.speak("Playback ended. Search interface restored.")
+											end
+										end
+									end
+									}, 10000)
+						end
+
+						function searchHandler(prompt)
+							vibrate()
+							local query = prompt or textInput.text
+							if #query == 0 then
+								updateResultText("Please enter a search keyword.")
+								return
+							end
+
+							addSearchHistory(query)
+
+							resetUi()
+							updateResultText("Searching, please wait...")
+
+							searchYoutube(query, function(jsonData, error)
+								if error then
+									updateResultText("Error: " .. error)
+								else
+									local status, data = pcall(cjson.decode, jsonData)
+
+									if status and data.status and type(data.result) == "table" and #data.result > 0 then
+
+										currentSortOrder = "default"
+										currentFilter = "none"
+
+										updateResultList(data.result)
+
+									else
+										local err_msg = (data and data.message) or "No results found."
+										updateResultText("API Error: " .. err_msg)
+									end
+								end
+							end)
+					end
+
+					searchButton.onClick = function()
+					searchHandler()
+				end
+
+				function playVideoByIndex(index, quality, startPosition)
+					vibrate()
+					if videoPlayer then videoPlayer.stopPlayback() end
+						stopUpdateTime()
+						currentMediaPlayer = nil
+						if not videoQueue[index+1] then return end
+							currentPlayingIndex = index
+							local item = videoQueue[index+1]
+							local videoTitle = item.title
+							currentSelectedURL = item.videoId
+							currentSelectedQuality = quality or defaultQuality or "720"
+							local cleanID = tostring(currentSelectedURL):gsub("%s+", "")
+							local targetUrl = "https://youtube.com/watch?v=" .. cleanID
+							local mediaType, mediaQuality
+							if isModeVideo then
+								mediaType = "mp4"
+								mediaQuality = tostring(currentSelectedQuality):gsub("p", "")
+							else
+								mediaType = "mp3"
+								mediaQuality = "128"
+							end
+							local playUrl = string.format(
+								"https://yogalabs.vercel.app/api/download/ytdl2?url=%s&type=%s&quality=%s",
+								Uri.encode(targetUrl),
+								mediaType,
+								mediaQuality
+								)
+							updateResultText("Meminta link " .. mediaType:upper() .. " (" .. mediaQuality .. ")...")
+							apiRequest(playUrl, function(jsonData, error)
+								if error then
+									updateResultText("Gagal: " .. error)
+									return
+								end
+								local status, data = pcall(cjson.decode, jsonData)
+								if status and data.success and data.result and data.result.download then
+									local directLink = data.result.download
+									timeHandler.post(Runnable{
+											run = function()
+											videoPlayer.setVisibility(View.VISIBLE)
+											timeText.setVisibility(View.VISIBLE)
+											seekBar.setVisibility(View.VISIBLE)
+											controlButtonsLayout.setVisibility(View.VISIBLE)
+											navigationButtonsLayout.setVisibility(View.VISIBLE)
+											queueActionsLayout.setVisibility(View.VISIBLE)
+											downloadVideoButton.setEnabled(true)
+											downloadAudioButton.setEnabled(true)
+											transcriptButton.setEnabled(true)
+											videoPlayer.setVideoURI(Uri.parse(directLink))
+											videoPlayer.requestFocus()
+											videoPlayer.setOnPreparedListener(MediaPlayer.OnPreparedListener{
+													onPrepared = function(mp)
+													currentMediaPlayer = mp
+													mp.setLooping(isLooping)
+													applyPlaybackParams(currentSpeed, currentPitch)
+													if startPosition and startPosition > 0 then
+														videoPlayer.seekTo(startPosition)
+													end
+													if requestAudioFocus() == 1 then
+														videoPlayer.start()
+														playPauseButton.text = "Pause"
+													end
+													searchLayout.setVisibility(View.GONE)
+													startUpdateTime()
+													service.speak("Memutar " .. mediaType:upper() .. ": " .. videoTitle)
+												end
+												})
+
+										videoPlayer.setOnCompletionListener(MediaPlayer.OnCompletionListener{
+												onCompletion = function(mp)
+												if mp.isLooping() then return end
+													updateResultText("Selesai.")
+													if isAutoNext and currentPlayingIndex < (#videoQueue - 1) then
+														playVideoByIndex(currentPlayingIndex + 1, currentSelectedQuality)
+													else
+														autoShowSearchLayout()
+													end
+												end
+												})
+									end
+									})
+						else
+							updateResultText("API Error: Link download tidak ditemukan.")
+						end
+					end)
+			end
+
+			function handleDownload(type)
+				vibrate()
+
+				if not currentSelectedURL or not currentSelectedQuality then
+					updateResultText("No video/quality selected for download.")
+					return
+				end
+
+				local downloadType = type
+				local selectedQuality = currentSelectedQuality
+				local fileExtension = (type == "video") and "mp4" or "mp3"
+
+				updateResultText("Preparing download for " .. downloadType .. " (" .. fileExtension .. ")...")
+
+				getDownloadLink(currentSelectedURL, downloadType, selectedQuality, function(jsonData, error)
+					timeHandler.post(Runnable { run = function()
+							if error then
+								updateResultText("Download error: " .. error)
+								return
+							end
+
+							local status, data = pcall(cjson.decode, jsonData)
+							if status and data.status == true and data.data and data.data.url then
+								local downloadUrl = data.data.url
+								local fileName = data.data.filename or ("youtube_" .. downloadType .. "_" .. selectedQuality .. "p." .. fileExtension)
+
+								if not fileName:match("%." .. fileExtension .. "$") then
+									fileName = fileName .. "." .. fileExtension
+								end
+
+								startDownload(downloadUrl, "Downloading " .. downloadType:upper(), fileName)
+							else
+								updateResultText("Failed to get download link. Format/Quality may not exist.")
+							end
+						end})
+			end)
+	end
+
+	function startDownload(url, title, fileName)
+		pcall(function()
+			local dm = activity.getSystemService(Context.DOWNLOAD_SERVICE)
+			local request = DownloadManager.Request(Uri.parse(url))
+
+			request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+			request.setTitle(title)
+			request.setDescription("Downloading: " .. fileName)
+			request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+			request.setAllowedOverMetered(true)
+			request.setAllowedOverRoaming(true)
+
+			dm.enqueue(request)
+			service.speak("Starting download: " .. title)
+
+		end)
+end
+
+settingsButton.onClick = showSettingsDialog
+sortFilterButton.onClick = showSortFilterDialog
+showChannelQueueButton.onClick = showChannelInfoAndQueue
+historyButton.onClick = showSearchHistory
+
+clearQueueButton.onClick = function()
+vibrate()
+local oldQueueSize = #videoQueue
+videoQueue = {}
+currentPlayingIndex = nil
+
+if videoPlayer and videoPlayer.isPlaying() then
+	videoPlayer.stopPlayback()
+	stopUpdateTime()
+	abandonAudioFocus()
+end
+
+resetUi()
+queueActionsLayout.setVisibility(View.GONE)
+updateResultText(string.format("Cleared %d items from the playback queue.", oldQueueSize))
+end
+
+addToQueueButton.onClick = function()
+vibrate()
+if #currentDisplayResults > 0 then
+	videoQueue = currentDisplayResults
+	currentPlayingIndex = 0
+	resultsList.setVisibility(View.GONE)
+	resultActionsLayout.setVisibility(View.GONE)
+
+	playVideoByIndex(currentPlayingIndex, defaultQuality)
+else
+	service.speak("No results to add to queue.")
+end
+end
+
+addToQueueSingleButton.onClick = function()
+vibrate()
+if currentPlayingIndex == nil or not videoQueue[currentPlayingIndex + 1] then
+	service.speak("No video currently playing to add to the queue.")
+	return
+end
+
+local item = videoQueue[currentPlayingIndex + 1]
+
+table.insert(videoQueue, {
+		title = item.title,
+		url = item.url,
+		timestamp = item.timestamp,
+		views = item.views
+		})
+
+local newIndex = #videoQueue
+service.speak(string.format("Added '%s' to the end of the queue. New position is %d.", item.title, newIndex))
+end
+
+resultsList.onItemClick = function(parent, view, position, id)
+vibrate()
+local selectedItem = currentDisplayResults[position + 1]
+
+if not selectedItem then
+	service.speak("Invalid item.")
+	return
+end
+
+videoQueue = {selectedItem}
+currentPlayingIndex = 0
+
+playVideoByIndex(currentPlayingIndex, defaultQuality)
+end
+
+previousButton.onClick = function()
+vibrate()
+if currentPlayingIndex ~= nil and currentPlayingIndex > 0 then
+	currentPlayingIndex = currentPlayingIndex - 1
+	playVideoByIndex(currentPlayingIndex, currentSelectedQuality)
+else
+	service.speak("Already at the first video in the queue.")
+end
+end
+
+nextButton.onClick = function()
+vibrate()
+if currentPlayingIndex ~= nil and currentPlayingIndex < (#videoQueue - 1) then
+	currentPlayingIndex = currentPlayingIndex + 1
+	playVideoByIndex(currentPlayingIndex, currentSelectedQuality)
+else
+	service.speak("Already at the last video in the queue.")
+end
+end
+
+rewindButton.onClick = function()
+vibrate()
+if videoPlayer and videoPlayer.canSeekBackward() then
+	local currentPos = videoPlayer.getCurrentPosition()
+	local newPos = math.max(0, currentPos - 10000)
+	videoPlayer.seekTo(newPos)
+	service.speak("Rewound 10 seconds")
+else
+	service.speak("Cannot rewind")
+end
+end
+
+forwardButton.onClick = function()
+vibrate()
+if videoPlayer and videoPlayer.canSeekForward() then
+	local currentPos = videoPlayer.getCurrentPosition()
+	local duration = videoPlayer.getDuration()
+	local newPos = math.min(duration, currentPos + 10000)
+	videoPlayer.seekTo(newPos)
+	service.speak("Forwarded 10 seconds")
+else
+	service.speak("Cannot forward")
+end
+end
+
+replayButton.onClick = function()
+vibrate()
+if videoPlayer and videoPlayer.getDuration() > 0 then
+	videoPlayer.seekTo(1)
+	local focusResult = requestAudioFocus()
+	if focusResult == AudioManager.AUDIOFOCUS_REQUEST_GRANTED then
+		videoPlayer.start()
+		applyPlaybackParams(currentSpeed, currentPitch)
+		applyVolumeBoost(currentVolumeBoost)
+		playPauseButton.text = "Pause"
+	else
+		service.speak("Cannot replay, audio focus denied.")
+	end
+
+	searchLayout.setVisibility(View.GONE)
+	startUpdateTime()
+end
+end
+
+playPauseButton.onClick = function()
+vibrate()
+if videoPlayer and videoPlayer.isPlaying() then
+	videoPlayer.pause()
+	playPauseButton.text = "Play"
+	service.speak("Paused")
+
+	abandonAudioFocus()
+
+	searchLayout.setVisibility(View.VISIBLE)
+	stopUpdateTime()
+else
+	local focusResult = requestAudioFocus()
+	if focusResult == AudioManager.AUDIOFOCUS_REQUEST_GRANTED then
+		videoPlayer.start()
+		applyPlaybackParams(currentSpeed, currentPitch)
+		applyVolumeBoost(currentVolumeBoost)
+		playPauseButton.text = "Pause"
+		service.speak("Playing")
+	else
+		service.speak("Cannot play, audio focus denied.")
+	end
+
+	searchLayout.setVisibility(View.GONE)
+	startUpdateTime()
+end
+end
+
+seekBar.setOnSeekBarChangeListener(SeekBar.OnSeekBarChangeListener{
+		onProgressChanged = function(sb, progress, fromUser)
+		if fromUser then
+			local currentMinutes = math.floor(progress / 60000)
+			local currentSeconds = math.floor((progress % 60000) / 1000)
+			local currentStr = string.format("%02d:%02d", currentMinutes, currentSeconds)
+			timeText.text = currentStr .. " / " .. string.sub(timeText.text, 9)
+		end
+		end,
+		onStartTrackingTouch = function(sb)
+		stopUpdateTime()
+		end,
+		onStopTrackingTouch = function(sb)
+		vibrate()
+		local newPosition = sb.getProgress()
+		videoPlayer.seekTo(newPosition)
+		service.speak("Seeked to " .. timeText.text)
+		startUpdateTime()
+		end
+		})
+
+downloadVideoButton.onClick = function()
+vibrate()
+handleDownload("video")
+end
+
+downloadAudioButton.onClick = function()
+vibrate()
+handleDownload("audio")
+end
+
+transcriptButton.onClick = function()
+vibrate()
+if not currentSelectedURL then
+	updateResultText("No video selected to get transcript.")
+	return
+end
+
+updateResultText("Fetching transcript, please wait...")
+service.speak("Fetching transcript")
+
+getTranscript(currentSelectedURL, function(transcript, error)
+	timeHandler.post(Runnable { run = function()
+			if error then
+				updateResultText("Transcript Error: " .. error)
+				service.speak("Transcript error.")
+			else
+				showTranscriptDialog(transcript)
+				updateResultText("Transcript loaded.")
+
+			end
+			end})
+	end)
+end
+
+micSearchButton.onClick = function()
+vibrate()
+local sr = SpeechRecognizer.createSpeechRecognizer(activity)
+
+resultText.text = "Listening..."
+
+sr.setRecognitionListener(RecognitionListener{
+		onReadyForSpeech=function(params)
+		resultText.text = "Listening..."
+		end,
+		onResults = function(results)
+		vibrate()
+		local data = results.getParcelableArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+		if data and data.size() > 0 then
+			local spokenText = data.get(0)
+
+			timeHandler.post(Runnable{
+					run = function()
+					searchHandler(spokenText)
+				end
+				})
+		else
+			resultText.text = "Could not recognize speech."
+		end
+		pcall(function() sr.destroy() end)
+		end,
+		onError = function(error)
+		vibrate()
+		resultText.text = "Recognition error: " .. tostring(error)
+		pcall(function() sr.destroy() end)
+		end,
+		})
+
+local intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+
+intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
+
+sr.startListening(intent)
+end
+
+closeButton.onClick = function()
+vibrate()
+if videoPlayer and videoPlayer.isPlaying() then
+	videoPlayer.stopPlayback()
+end
+stopUpdateTime()
+abandonAudioFocus()
+dlg.dismiss()
+end
+
+service.playSoundTick()
+vibrate()
+dlg.show()
