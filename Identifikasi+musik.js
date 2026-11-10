@@ -30,7 +30,6 @@ async function whatmusic(buffer) {
 }
 
 function toTime(ms) {
-    const h = Math.floor(ms / 3600000);
     const m = Math.floor(ms / 60000) % 60;
     const s = Math.floor(ms / 1000) % 60;
     return [m, s].map((v) => v.toString().padStart(2, "0")).join(":");
